@@ -10,6 +10,11 @@
         "internalType": "address",
         "name": "_router",
         "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "_priceOracle",
+        "type": "address"
       }
     ],
     "stateMutability": "nonpayable",
@@ -82,6 +87,31 @@
       }
     ],
     "name": "Liquidation",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "positionId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "orderId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "LiquidationShortfall",
     "type": "event"
   },
   {
@@ -497,6 +527,25 @@
         "type": "uint256"
       },
       {
+        "indexed": false,
+        "internalType": "address",
+        "name": "by",
+        "type": "address"
+      }
+    ],
+    "name": "PositionUnfrozen",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "positionId",
+        "type": "uint256"
+      },
+      {
         "indexed": true,
         "internalType": "address",
         "name": "asset",
@@ -536,6 +585,19 @@
     ],
     "name": "TokenlistAdded",
     "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "MAINTENANCE_MARGIN_BPS",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
   },
   {
     "inputs": [
@@ -779,30 +841,6 @@
     "inputs": [
       {
         "internalType": "uint256",
-        "name": "_positionId",
-        "type": "uint256"
-      },
-      {
-        "internalType": "uint24[]",
-        "name": "_feeTiers",
-        "type": "uint24[]"
-      }
-    ],
-    "name": "getPositionActualPools",
-    "outputs": [
-      {
-        "internalType": "address[]",
-        "name": "_pools",
-        "type": "address[]"
-      }
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "uint256",
         "name": "id",
         "type": "uint256"
       }
@@ -864,25 +902,6 @@
   {
     "inputs": [
       {
-        "internalType": "uint256",
-        "name": "_positionId",
-        "type": "uint256"
-      }
-    ],
-    "name": "getPositionTokenlistID",
-    "outputs": [
-      {
-        "internalType": "bytes32",
-        "name": "_whitelistId",
-        "type": "bytes32"
-      }
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
         "internalType": "bytes32",
         "name": "_hash",
         "type": "bytes32"
@@ -932,6 +951,29 @@
       }
     ],
     "name": "liquidate",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "positionId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "asset",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "liquidateStep",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -1111,7 +1153,7 @@
         "type": "bytes[]"
       }
     ],
-    "stateMutability": "payable",
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {
@@ -1198,6 +1240,25 @@
     "inputs": [
       {
         "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "name": "orderShortfall",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
         "name": "_orderId",
         "type": "uint256"
       },
@@ -1228,9 +1289,9 @@
         "type": "bool"
       },
       {
-        "internalType": "uint8",
+        "internalType": "uint248",
         "name": "positions",
-        "type": "uint8"
+        "type": "uint248"
       }
     ],
     "stateMutability": "view",
@@ -1508,6 +1569,19 @@
   },
   {
     "inputs": [],
+    "name": "priceOracle",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "router",
     "outputs": [
       {
@@ -1674,6 +1748,19 @@
       }
     ],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "positionId",
+        "type": "uint256"
+      }
+    ],
+    "name": "unfreeze",
+    "outputs": [],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {
