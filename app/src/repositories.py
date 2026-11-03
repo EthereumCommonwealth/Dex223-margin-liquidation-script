@@ -189,6 +189,12 @@ class PoolRepository(BaseRepository):
             res = await s.execute(stmt)
             return res.scalars().all()
 
+    async def find_open(self) -> Iterable[int]:
+        stmt = select(Position.id).where(Position.is_liquidated.is_(False))
+        async with self._session_scope(tx=False) as s:
+            res = await s.execute(stmt)
+            return res.scalars().all()
+
     async def find_overdue(self, cutoff_ts: int) -> Iterable[int]:
         stmt = select(Position.id).where(
             Position.is_liquidated.is_(False),
