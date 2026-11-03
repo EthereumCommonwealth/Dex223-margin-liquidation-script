@@ -3,6 +3,7 @@ from typing import AsyncGenerator, Set
 from web3 import AsyncWeb3
 from web3.types import BlockData
 
+from config import settings
 from core.topics import TopicsRegistry
 from core.contracts import MarginModuleClient
 from services.positions import PositionService
@@ -26,6 +27,7 @@ class EventOrchestrator:
             pools: PoolService,
     ):
         self.w3 = w3
+        self.sweep_every_blocks = settings.SWEEP_EVERY_BLOCKS
         self.topics = topics
         self.mm = mm
         self.positions = positions
@@ -77,6 +79,16 @@ class EventOrchestrator:
             if pid not in emitted:
                 emitted.add(pid)
                 yield pid
+
+        # 5) The oracle values holdings at a TWAP, which keeps moving for its whole window after the
+        # last swap, with no further events. A position can cross the threshold in that tail (Sepolia
+        # v4 position 36, 2026-10-31), so every open position is rechecked periodically.
+        every = self.sweep_every_blocks
+        if every > 0 and block["number"] % every == 0:
+            for pid in await self.pools.open_positions():
+                if pid not in emitted:
+                    emitted.add(pid)
+                    yield pid
 
     async def _get_logs(self, block: BlockData) -> list[dict]:
         if not self.topics.all_topics:

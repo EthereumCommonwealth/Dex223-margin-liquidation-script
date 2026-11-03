@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     FEE_TIERS: list[int] = [500, 3000, 10000]
     MARGIN_MODULE_ADDRESS: str
     LIQUIDATE_ADDRESS: Optional[str] = None
+    # Every this many blocks, check every open position (0 disables). A pool event checks its own
+    # positions, but the oracle's TWAP keeps moving for its whole window after the last swap.
+    SWEEP_EVERY_BLOCKS: int = 25
     DATABASE_URL: str
     ABI_PATH: Path = ROOT_PATH / "src" / 'abi'
     model_config = SettingsConfigDict(

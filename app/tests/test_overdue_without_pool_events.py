@@ -33,12 +33,38 @@ class _Topics:
 class _Pools:
     def __init__(self, overdue, by_pool=None):
         self.overdue, self.by_pool = overdue, by_pool or {}
+        self.open = []
 
     async def affected_positions(self, pool, ts):
         return self.by_pool.get(pool, [])
 
     async def overdue_positions(self, ts):
         return self.overdue
+
+    async def open_positions(self):
+        return self.open
+
+
+def _sweeping(pools, every, open_ids):
+    pools.open = open_ids
+    orch = _orchestrator(pools)
+    orch.sweep_every_blocks = every
+    return orch
+
+
+async def test_sweep_block_rechecks_every_open_position_once():
+    orch = _sweeping(_Pools(overdue=[7]), every=25, open_ids=[7, 8, 9])
+    assert [p async for p in orch.handle_block({"number": 50, "timestamp": 100})] == [7, 8, 9]
+
+
+async def test_other_blocks_do_not_sweep():
+    orch = _sweeping(_Pools(overdue=[]), every=25, open_ids=[8])
+    assert [p async for p in orch.handle_block({"number": 51, "timestamp": 100})] == []
+
+
+async def test_sweep_can_be_disabled():
+    orch = _sweeping(_Pools(overdue=[]), every=0, open_ids=[8])
+    assert [p async for p in orch.handle_block({"number": 50, "timestamp": 100})] == []
 
 
 def _orchestrator(pools):

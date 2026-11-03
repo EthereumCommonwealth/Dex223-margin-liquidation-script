@@ -14,3 +14,7 @@ class PoolService:
     async def overdue_positions(self, ts: int) -> list[int]:
         repo = PoolRepository(session_factory=self.sf)
         return list(await repo.find_overdue(cutoff_ts=ts))
+
+    async def open_positions(self) -> list[int]:
+        repo = PoolRepository(session_factory=self.sf)
+        return list(await repo.find_open())
