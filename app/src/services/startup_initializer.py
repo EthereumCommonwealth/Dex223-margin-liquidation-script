@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 import asyncio
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -6,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from core.contracts import MarginModuleClient
 from repositories import PositionRepository
 from services.positions import PositionService
-from services.liquidator import LiquidatorService
+from services.liquidator import LiquidatorService, claimable, freeze_lapsed
 
 
 class StartupInitializer:
@@ -40,8 +41,8 @@ class StartupInitializer:
             if not dto.liquidated:
                 await self.pos_service.sync_pools(pid)
 
-            # ⛓️ freeze immediately if eligible and nobody froze yet
-            if dto.status is True and dto.liquidator is None:
+            # ⛓️ freeze immediately if eligible and nobody holds a live freeze
+            if claimable(dto, int(time.time())):
                 await self.liquidator.freeze_now(pid)
 
     async def _recover_frozen(self, pid: int) -> bool:
@@ -65,6 +66,8 @@ class StartupInitializer:
                 return False
             if dto.liquidator.lower() != self.liquidator.liquidate_address.lower():
                 return False  # somebody else holds the freeze
+            if freeze_lapsed(dto, int(time.time())):
+                return False  # lapsed: _freeze_if_eligible renews it
 
             # block 0 so to_liquidate() releases it on the very next block; the contract's own
             # "frozenTime < block.timestamp" check still enforces the one-block delay.
@@ -85,7 +88,7 @@ class StartupInitializer:
             except Exception as e:
                 logger.warning(f"StartupInitializer: could not read position {pid}: {e}")
                 return False
-        if dto.liquidated or dto.status is not True or dto.liquidator is not None:
+        if not claimable(dto, int(time.time())):
             return False
         await self.liquidator.freeze_now(pid)
         return True

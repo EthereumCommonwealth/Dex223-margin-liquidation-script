@@ -16,12 +16,15 @@ os.environ.setdefault("MARGIN_MODULE_ADDRESS", "0x5D63230470AB553195dfaf794de3e9
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
 
 import asyncio  # noqa: E402
+import time  # noqa: E402
 import pytest  # noqa: E402
 from services.startup_initializer import StartupInitializer  # noqa: E402
 from services.liquidator import SubjectToLiquidation  # noqa: E402
 
 US = "0x0000000000000000000000000000000000000009"
 THEM = "0x000000000000000000000000000000000000000B"
+LIVE = int(time.time())  # a freeze placed just now
+LAPSED = LIVE - 2 * 3600
 
 
 class FakeMM:
@@ -52,7 +55,7 @@ def build(subjects):
 
 @pytest.mark.asyncio
 async def test_recovers_a_freeze_we_still_hold():
-    subjects = {7: SubjectToLiquidation(True, US, 1234, None, False)}
+    subjects = {7: SubjectToLiquidation(True, US, LIVE, None, False)}
     init = build(subjects)
     assert await init._recover_frozen(7) is True
     assert 7 in init.liquidator.frozen_positions, "frozen position was not re-armed"
@@ -60,7 +63,7 @@ async def test_recovers_a_freeze_we_still_hold():
 
 @pytest.mark.asyncio
 async def test_ignores_a_freeze_held_by_someone_else():
-    subjects = {7: SubjectToLiquidation(True, THEM, 1234, None, False)}
+    subjects = {7: SubjectToLiquidation(True, THEM, LIVE, None, False)}
     init = build(subjects)
     assert await init._recover_frozen(7) is False
     assert init.liquidator.frozen_positions == {}
@@ -76,7 +79,7 @@ async def test_ignores_an_unfrozen_position():
 
 @pytest.mark.asyncio
 async def test_ignores_an_already_liquidated_position():
-    subjects = {7: SubjectToLiquidation(False, US, 1234, None, True)}
+    subjects = {7: SubjectToLiquidation(False, US, LIVE, None, True)}
     init = build(subjects)
     assert await init._recover_frozen(7) is False
     assert init.liquidator.frozen_positions == {}
@@ -84,7 +87,7 @@ async def test_ignores_an_already_liquidated_position():
 
 @pytest.mark.asyncio
 async def test_matches_the_liquidator_address_case_insensitively():
-    subjects = {7: SubjectToLiquidation(True, US.upper(), 1234, None, False)}
+    subjects = {7: SubjectToLiquidation(True, US.upper(), LIVE, None, False)}
     init = build(subjects)
     assert await init._recover_frozen(7) is True
 
@@ -111,10 +114,25 @@ async def test_freezes_a_known_position_that_went_underwater_unclaimed():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("subject", [
     SubjectToLiquidation(False, None, None, 99, False),   # healthy
-    SubjectToLiquidation(True, THEM, 1234, None, False),  # someone else froze it
+    SubjectToLiquidation(True, THEM, LIVE, None, False),  # someone else froze it
     SubjectToLiquidation(True, None, None, None, True),   # already liquidated
 ])
 async def test_does_not_freeze_a_position_that_is_not_ours_to_take(subject):
     init = build({7: subject})
     assert await init._freeze_if_eligible(7) is False
     assert init.liquidator.freeze_now_calls == []
+
+
+@pytest.mark.asyncio
+async def test_freezes_a_position_whose_foreign_freeze_lapsed():
+    init = build({7: SubjectToLiquidation(True, THEM, LAPSED, None, False)})
+    assert await init._freeze_if_eligible(7) is True
+    assert init.liquidator.freeze_now_calls == [7]
+
+
+@pytest.mark.asyncio
+async def test_does_not_rearm_our_own_lapsed_freeze():
+    """liquidate() would only renew it, so it goes through _freeze_if_eligible instead."""
+    init = build({7: SubjectToLiquidation(True, US, LAPSED, None, False)})
+    assert await init._recover_frozen(7) is False
+    assert await init._freeze_if_eligible(7) is True
