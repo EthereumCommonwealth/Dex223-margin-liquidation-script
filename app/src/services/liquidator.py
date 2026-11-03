@@ -1,4 +1,5 @@
 import copy
+import time
 import asyncio
 from loguru import logger
 from typing import Iterable
@@ -21,6 +22,34 @@ class SubjectToLiquidation:
     frozen_ts: int | None
     predict_timestamp: int | None
     liquidated: bool = False
+
+
+# Dex223MarginModule.MAX_FREEZE_DURATION. While a freeze is live the next liquidate() call completes
+# the liquidation; once it has lapsed, liquidate() from anyone places a new freeze instead.
+MAX_FREEZE_DURATION = 3600
+# How close to lapsing a freeze is treated as unsafe to act on: the transaction lands a block or more
+# after the block we decided on, so it may meet the other branch of the contract.
+FREEZE_LAPSE_MARGIN = 60
+
+
+def freeze_age(subject: SubjectToLiquidation, now: int) -> int | None:
+    return now - subject.frozen_ts if subject.frozen_ts else None
+
+
+def freeze_lapsed(subject: SubjectToLiquidation, now: int) -> bool:
+    age = freeze_age(subject, now)
+    return age is not None and age > MAX_FREEZE_DURATION
+
+
+def claimable(subject: SubjectToLiquidation, now: int) -> bool:
+    """Liquidatable, and free for us to freeze.
+
+    A position someone froze and then abandoned used to be skipped forever, because any non-zero
+    liquidator counted as taken. The contract only gives the freezer MAX_FREEZE_DURATION.
+    """
+    if subject.status is not True or subject.liquidated:
+        return False
+    return subject.liquidator is None or freeze_lapsed(subject, now)
 
 
 class LiquidatorService:
@@ -60,12 +89,16 @@ class LiquidatorService:
             await PositionRepository(session_factory=self.sf).set_liquidated(position_id)
             return
 
-        if subject.status is False or subject.liquidator is not None:
+        if not claimable(subject, block["timestamp"]):
             logger.info(f"Position {position_id} not eligible at block {block['number']}")
             await PositionRepository(session_factory=self.sf).set_predict_timestamp(
                 position_id=position_id, ts=subject.predict_timestamp
             )
             return
+        if subject.liquidator is not None:
+            logger.warning(
+                f"Freeze on position {position_id} by {subject.liquidator} has lapsed; taking it over"
+            )
 
         # send freeze (first call freezes on your address)
         tx_hash = await self._send_liquidate_tx(position_id)
@@ -99,7 +132,7 @@ class LiquidatorService:
         if subject.liquidated is True:
             await PositionRepository(session_factory=self.sf).set_liquidated(position_id)
             return
-        if subject.status is False or subject.liquidator is not None:
+        if not claimable(subject, int(time.time())):
             await PositionRepository(session_factory=self.sf).set_predict_timestamp(
                 position_id, subject.predict_timestamp
             )
@@ -147,6 +180,18 @@ class LiquidatorService:
                 logger.info(f"Position {position_id} no longer liquidatable at block {block['number']}")
                 self.frozen_positions.pop(position_id, None)
                 self._liquidate_attempts.pop(position_id, None)
+                return
+
+            # Once our freeze has lapsed, liquidate() only renews it. Sending it here used to be
+            # recorded as a liquidation, and the open position was never looked at again.
+            age = freeze_age(subject, block["timestamp"])
+            if age is not None and age > MAX_FREEZE_DURATION - FREEZE_LAPSE_MARGIN:
+                if age > MAX_FREEZE_DURATION:
+                    logger.warning(f"Our freeze on position {position_id} has lapsed; renewing it")
+                    self.frozen_positions.pop(position_id, None)
+                    self._liquidate_attempts.pop(position_id, None)
+                    await self.frozen(position_id, block)
+                # else: too close to call; still queued, so the next block decides
                 return
 
             tx_hash = await self._send_liquidate_tx(position_id)

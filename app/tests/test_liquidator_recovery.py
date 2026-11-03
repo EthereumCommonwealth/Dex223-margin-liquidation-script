@@ -102,7 +102,7 @@ async def test_freeze_receipt_timeout_does_not_strand_the_position(monkeypatch):
     svc = build(monkeypatch, eth, SubjectToLiquidation(True, None, 1, 1, False))
 
     with pytest.raises(TimeoutError):
-        await svc.frozen(42, {"number": 100})
+        await svc.frozen(42, {"number": 100, "timestamp": 100})
 
     assert 42 not in svc._freeze_txs, "position stranded: it would never be retried"
 
@@ -113,7 +113,7 @@ async def test_liquidate_failure_keeps_position_for_retry(monkeypatch):
     svc = build(monkeypatch, FakeEth(), ELIGIBLE, send_raises=RuntimeError("rpc down"))
     svc.frozen_positions[7] = 50
 
-    await svc.liquidate(7, {"number": 51})
+    await svc.liquidate(7, {"number": 51, "timestamp": 100})
 
     assert 7 in svc.frozen_positions, "frozen position dropped after a transient failure"
     assert ("set_liquidated", 7) not in FakeRepo.calls, "DB marked liquidated despite failure"
@@ -125,7 +125,7 @@ async def test_liquidate_does_not_mark_db_when_tx_reverts(monkeypatch):
     svc = build(monkeypatch, FakeEth(receipt={"status": 0, "blockNumber": 52}), ELIGIBLE)
     svc.frozen_positions[8] = 50
 
-    await svc.liquidate(8, {"number": 51})
+    await svc.liquidate(8, {"number": 51, "timestamp": 100})
 
     assert ("set_liquidated", 8) not in FakeRepo.calls, "reverted tx recorded as liquidated"
 
@@ -135,7 +135,7 @@ async def test_liquidate_success_marks_db_and_clears_state(monkeypatch):
     svc = build(monkeypatch, FakeEth(receipt={"status": 1, "blockNumber": 52}), ELIGIBLE)
     svc.frozen_positions[9] = 50
 
-    await svc.liquidate(9, {"number": 51})
+    await svc.liquidate(9, {"number": 51, "timestamp": 100})
 
     assert ("set_liquidated", 9) in FakeRepo.calls
     assert 9 not in svc.frozen_positions
@@ -149,7 +149,7 @@ async def test_liquidate_gives_up_after_max_attempts(monkeypatch):
     svc.frozen_positions[10] = 50
 
     for _ in range(LiquidatorService.MAX_LIQUIDATE_ATTEMPTS):
-        await svc.liquidate(10, {"number": 51})
+        await svc.liquidate(10, {"number": 51, "timestamp": 100})
 
     assert 10 not in svc.frozen_positions, "should stop retrying after the cap"
     assert ("set_liquidated", 10) not in FakeRepo.calls
@@ -161,7 +161,57 @@ async def test_ineligible_position_is_dropped_not_retried(monkeypatch):
     svc = build(monkeypatch, FakeEth(), ineligible)
     svc.frozen_positions[11] = 50
 
-    await svc.liquidate(11, {"number": 51})
+    await svc.liquidate(11, {"number": 51, "timestamp": 100})
 
     assert 11 not in svc.frozen_positions
     assert ("set_liquidated", 11) not in FakeRepo.calls
+
+
+THEM = "0x000000000000000000000000000000000000000B"
+
+
+@pytest.mark.asyncio
+async def test_takes_over_a_freeze_someone_else_let_lapse(monkeypatch):
+    """An abandoned freeze held by another address used to block the position forever."""
+    lapsed = SubjectToLiquidation(True, THEM, 1_000, None, False)
+    svc = build(monkeypatch, FakeEth(receipt={"status": 1, "blockNumber": 101}), lapsed)
+
+    await svc.frozen(12, {"number": 100, "timestamp": 1_000 + liq_mod.MAX_FREEZE_DURATION + 1})
+
+    assert svc.frozen_positions == {12: 101}, "lapsed freeze was not taken over"
+
+
+@pytest.mark.asyncio
+async def test_leaves_a_live_freeze_held_by_someone_else(monkeypatch):
+    live = SubjectToLiquidation(True, THEM, 1_000, None, False)
+    svc = build(monkeypatch, FakeEth(receipt={"status": 1, "blockNumber": 101}), live)
+
+    await svc.frozen(13, {"number": 100, "timestamp": 1_000 + liq_mod.MAX_FREEZE_DURATION})
+
+    assert svc.frozen_positions == {}
+
+
+@pytest.mark.asyncio
+async def test_a_lapsed_freeze_of_ours_is_renewed_not_recorded_as_liquidated(monkeypatch):
+    """liquidate() on a lapsed freeze only places a new one; it must not mark the DB."""
+    ours_lapsed = SubjectToLiquidation(True, "0x0000000000000000000000000000000000000009",
+                                       1_000, None, False)
+    svc = build(monkeypatch, FakeEth(receipt={"status": 1, "blockNumber": 201}), ours_lapsed)
+    svc.frozen_positions[14] = 50
+
+    await svc.liquidate(14, {"number": 200, "timestamp": 1_000 + liq_mod.MAX_FREEZE_DURATION + 1})
+
+    assert ("set_liquidated", 14) not in FakeRepo.calls, "a renewed freeze was recorded as liquidated"
+    assert svc.frozen_positions == {14: 201}, "renewed freeze was not queued for liquidation"
+
+
+@pytest.mark.asyncio
+async def test_a_freeze_about_to_lapse_waits_for_the_next_block(monkeypatch):
+    ours = SubjectToLiquidation(True, "0x0000000000000000000000000000000000000009", 1_000, None, False)
+    svc = build(monkeypatch, FakeEth(receipt={"status": 1, "blockNumber": 201}), ours)
+    svc.frozen_positions[15] = 50
+
+    await svc.liquidate(15, {"number": 200, "timestamp": 1_000 + liq_mod.MAX_FREEZE_DURATION - 10})
+
+    assert svc.frozen_positions == {15: 50}, "position should stay queued unchanged"
+    assert FakeRepo.calls == []
