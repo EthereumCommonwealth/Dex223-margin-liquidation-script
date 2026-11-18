@@ -59,6 +59,28 @@ async def main():
     )
     await initializer.run()
 
+    background: set[asyncio.Task] = set()
+
+    def spawn(coro) -> None:
+        task = asyncio.create_task(coro)
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    async def act(ids, block):
+        # parallel: each call has its own session/connection
+        fr = await asyncio.gather(*(liquidator.frozen(pid, block) for pid in ids), return_exceptions=True)
+        for r in fr:
+            if isinstance(r, Exception):
+                logger.warning(f"freeze task error: {r!r}")
+
+        liq = await asyncio.gather(
+            *(liquidator.liquidate(pid, block) for pid in liquidator.to_liquidate(block)),
+            return_exceptions=True
+        )
+        for r in liq:
+            if isinstance(r, Exception):
+                logger.warning(f"liquidate task error: {r!r}")
+
     async def worker():
         while True:
             block = await queue.get()
@@ -89,19 +111,12 @@ async def main():
                         else:
                             await asyncio.sleep(1.0)
 
-                # parallel: each call has its own session/connection
-                fr = await asyncio.gather(*(liquidator.frozen(pid, block) for pid in ids), return_exceptions=True)
-                for r in fr:
-                    if isinstance(r, Exception):
-                        logger.warning(f"freeze task error: {r!r}")
-
-                liq = await asyncio.gather(
-                    *(liquidator.liquidate(pid, block) for pid in liquidator.to_liquidate(block)),
-                    return_exceptions=True
-                )
-                for r in liq:
-                    if isinstance(r, Exception):
-                        logger.warning(f"liquidate task error: {r!r}")
+                # Freezes and liquidations wait up to 600 s for their receipts. Awaiting them here
+                # stalled the worker for every slow or dropped transaction while the poller kept
+                # queueing blocks (Sepolia, 2026-11-18: 10,000 blocks behind, and the RPC no longer
+                # served logs for blocks that old). They run in the background instead; the
+                # liquidator's in-flight guard keeps a later block from starting a second one.
+                spawn(act(ids, block))
             finally:
                 queue.task_done()
 
