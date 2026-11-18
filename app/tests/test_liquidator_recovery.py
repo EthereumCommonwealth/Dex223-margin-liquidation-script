@@ -18,6 +18,7 @@ os.environ.setdefault(
 os.environ.setdefault("MARGIN_MODULE_ADDRESS", "0x5D63230470AB553195dfaf794de3e94C69d150f9")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
 
+import asyncio  # noqa: E402
 import pytest  # noqa: E402
 from services import liquidator as liq_mod  # noqa: E402
 from services.liquidator import LiquidatorService, SubjectToLiquidation  # noqa: E402
@@ -70,6 +71,8 @@ def build(monkeypatch, eth, subject, send_raises=None):
     svc._freeze_txs = {}
     svc.frozen_positions = {}
     svc._liquidate_attempts = {}
+    svc._busy = set()
+    svc._loss_window_until = {}
 
     class FakeMM:
         async def subject_to_liquidation(self, pid):
@@ -215,3 +218,62 @@ async def test_a_freeze_about_to_lapse_waits_for_the_next_block(monkeypatch):
 
     assert svc.frozen_positions == {15: 50}, "position should stay queued unchanged"
     assert FakeRepo.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mm38_holds_the_position_until_the_lender_window_ends(monkeypatch):
+    """Completion reverting MM38 (under water, lender-only window) must not be retried or re-frozen.
+
+    Before, the bot retried, gave up, and froze the position again every hour for 24 hours.
+    """
+    eth = FakeEth(receipt={"status": 1, "blockNumber": 60})
+    svc = build(monkeypatch, eth, ELIGIBLE, send_raises=RuntimeError("execution reverted: MM38"))
+    svc.frozen_positions[13] = 50
+    await svc.liquidate(13, {"number": 51, "timestamp": 2})
+    assert 13 not in svc.frozen_positions
+    assert svc._loss_window_until[13] > 0
+
+    sent = []
+
+    async def _send(pid):
+        sent.append(pid)
+        return FakeHash(b"\x22" * 32)
+
+    svc._send_liquidate_tx = _send
+    lapsed = SubjectToLiquidation(status=True, liquidator=None, frozen_ts=None, predict_timestamp=0)
+    svc.mm.subject_to_liquidation = lambda pid: _value(lapsed)
+    await svc.frozen(13, {"number": 52, "timestamp": 3})
+    assert sent == [], "re-froze a position the bot cannot liquidate yet"
+
+    svc._loss_window_until[13] = 0  # window over
+    await svc.frozen(13, {"number": 53, "timestamp": 4})
+    assert sent == [13]
+
+
+async def _value(v):
+    return v
+
+
+@pytest.mark.asyncio
+async def test_a_position_in_flight_is_not_started_twice(monkeypatch):
+    """The worker runs freezes in the background; a later block must not send a second one."""
+    eth = FakeEth(receipt={"status": 1, "blockNumber": 60})
+    svc = build(monkeypatch, eth, SubjectToLiquidation(
+        status=True, liquidator=None, frozen_ts=None, predict_timestamp=0))
+    sent = []
+    gate = asyncio.Event()
+
+    async def _send(pid):
+        sent.append(pid)
+        await gate.wait()
+        return FakeHash(b"\x33" * 32)
+
+    svc._send_liquidate_tx = _send
+    first = asyncio.create_task(svc.frozen(14, {"number": 1, "timestamp": 1}))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await svc.frozen(14, {"number": 2, "timestamp": 2})
+    gate.set()
+    await first
+    assert sent == [14]
+    assert svc.frozen_positions == {14: 60}

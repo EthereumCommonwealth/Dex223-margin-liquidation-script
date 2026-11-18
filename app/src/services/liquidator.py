@@ -30,6 +30,9 @@ MAX_FREEZE_DURATION = 3600
 # How close to lapsing a freeze is treated as unsafe to act on: the transaction lands a block or more
 # after the block we decided on, so it may meet the other branch of the contract.
 FREEZE_LAPSE_MARGIN = 60
+# Dex223MarginModule.LENDER_WINDOW. While a position is under water, only the order owner or the
+# order's keeper may complete a loss liquidation for this long (revert MM38).
+LENDER_WINDOW = 24 * 3600
 
 
 def freeze_age(subject: SubjectToLiquidation, now: int) -> int | None:
@@ -69,7 +72,6 @@ class LiquidatorService:
         self.account = Account.from_key(settings.PRIVATE_KEY)
         self.from_address = self.account.address
         self.liquidate_address = settings.LIQUIDATE_ADDRESS or self.from_address
-        self._nonce: int = 0
         self._nonce_lock = asyncio.Lock()
         self._chain_id = None
 
@@ -77,11 +79,37 @@ class LiquidatorService:
         self._freeze_txs: dict[int, HexBytes] = {}
         self.frozen_positions: dict[int, int] = {}  # positionId -> block_number
         self._liquidate_attempts: dict[int, int] = {}  # positionId -> failed attempts
+        # positions with a freeze or liquidation in flight. The worker runs these as background
+        # tasks, so the next block must not start a second one for the same position.
+        self._busy: set[int] = set()
+        # positionId -> unix time: completion reverted MM38 (lender-only window), so freezing it again
+        # before then only burns gas.
+        self._loss_window_until: dict[int, int] = {}
+
+    def _in_loss_window(self, position_id: int) -> bool:
+        until = self._loss_window_until.get(position_id)
+        if until is None:
+            return False
+        if time.time() < until:
+            return True
+        self._loss_window_until.pop(position_id, None)
+        return False
 
     async def frozen(self, position_id: int, block: BlockData) -> None:
         # already processed / awaiting receipt
-        if position_id in self._freeze_txs or position_id in self.frozen_positions:
+        if (position_id in self._busy or position_id in self._freeze_txs
+                or position_id in self.frozen_positions):
             return
+        if self._in_loss_window(position_id):
+            logger.debug(f"Position {position_id} is in the lender-only window; not freezing")
+            return
+        self._busy.add(position_id)
+        try:
+            await self._freeze(position_id, block)
+        finally:
+            self._busy.discard(position_id)
+
+    async def _freeze(self, position_id: int, block: BlockData) -> None:
 
         subject = await self.mm.subject_to_liquidation(position_id)
         if subject.liquidated is True:
@@ -165,6 +193,15 @@ class LiquidatorService:
             yield position_id
 
     async def liquidate(self, position_id, block: BlockData) -> None:
+        if position_id in self._busy:
+            return
+        self._busy.add(position_id)
+        try:
+            await self._liquidate(position_id, block)
+        finally:
+            self._busy.discard(position_id)
+
+    async def _liquidate(self, position_id, block: BlockData) -> None:
         # NOTE: this used to `del self.frozen_positions[position_id]` first, so any failure below
         # dropped the position permanently - already frozen on chain (gas paid, liquidator rights held)
         # but never liquidated. It also called set_liquidated() straight after send_raw_transaction,
@@ -190,7 +227,7 @@ class LiquidatorService:
                     logger.warning(f"Our freeze on position {position_id} has lapsed; renewing it")
                     self.frozen_positions.pop(position_id, None)
                     self._liquidate_attempts.pop(position_id, None)
-                    await self.frozen(position_id, block)
+                    await self._freeze(position_id, block)
                 # else: too close to call; still queued, so the next block decides
                 return
 
@@ -209,6 +246,19 @@ class LiquidatorService:
             self._liquidate_attempts.pop(position_id, None)
             logger.info(f"Liquidated position {position_id} in block {receipt['blockNumber']}")
         except Exception as e:
+            if "MM38" in str(e):
+                # Under water, and for LENDER_WINDOW after it first went under (our own freeze set
+                # that clock) only the lender or its keeper may realize the loss. Retrying, or
+                # re-freezing every hour, cannot succeed before then.
+                until = int(time.time()) + LENDER_WINDOW
+                self._loss_window_until[position_id] = until
+                self.frozen_positions.pop(position_id, None)
+                self._liquidate_attempts.pop(position_id, None)
+                logger.warning(
+                    f"Position {position_id} is under water: lender-only window (MM38). "
+                    f"Not retrying before {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(until))} UTC"
+                )
+                return
             attempts = self._liquidate_attempts.get(position_id, 0) + 1
             self._liquidate_attempts[position_id] = attempts
             if attempts >= self.MAX_LIQUIDATE_ATTEMPTS:
@@ -231,36 +281,37 @@ class LiquidatorService:
         if self._chain_id is None:
             self._chain_id = await self.w3.eth.chain_id
 
+        # The nonce comes from the node every time, and estimating, signing and sending all happen
+        # under the lock. A local counter was reserved before estimate_gas: when the estimate reverted
+        # (MM23, MM38, ...) the counter still advanced, every later transaction carried a nonce above
+        # the chain's next one, and none was ever mined (Sepolia, 2026-11-18: positions 50 and 51
+        # re-sent every ~13 min while pending stayed at 60).
         async with self._nonce_lock:
-            pending = await self.w3.eth.get_transaction_count(self.from_address, "pending")
-            if pending > self._nonce or self._nonce == 0:
-                self._nonce = pending
-            nonce_to_use = self._nonce
-            self._nonce += 1
+            nonce = await self.w3.eth.get_transaction_count(self.from_address, "pending")
 
-        max_priority_fee, hist = await asyncio.gather(
-            self.w3.eth.max_priority_fee,
-            self.w3.eth.fee_history(1, "latest", [10]),
-        )
+            max_priority_fee, hist = await asyncio.gather(
+                self.w3.eth.max_priority_fee,
+                self.w3.eth.fee_history(1, "latest", [10]),
+            )
 
-        priority_fee = max_priority_fee + 2_000_000_000  # +2 gwei
-        base_fee = hist["baseFeePerGas"][-1]
-        max_fee = base_fee + priority_fee
+            priority_fee = max_priority_fee + 2_000_000_000  # +2 gwei
+            base_fee = hist["baseFeePerGas"][-1]
+            max_fee = base_fee + priority_fee
 
-        call = self.mm.contract.functions.liquidate(position_id, self.liquidate_address)
-        # A fixed 50M limit exceeds the per-transaction cap (EIP-7825, 2**24) and makes the node
-        # demand 50M * maxFeePerGas up front, so every freeze and liquidation was rejected.
-        estimate = await call.estimate_gas({"from": self.from_address})
-        gas = min(estimate * 13 // 10, self.MAX_TX_GAS)
+            call = self.mm.contract.functions.liquidate(position_id, self.liquidate_address)
+            # A fixed 50M limit exceeds the per-transaction cap (EIP-7825, 2**24) and makes the node
+            # demand 50M * maxFeePerGas up front, so every freeze and liquidation was rejected.
+            estimate = await call.estimate_gas({"from": self.from_address})
+            gas = min(estimate * 13 // 10, self.MAX_TX_GAS)
 
-        tx = await call.build_transaction({
-            "from": self.from_address,
-            "nonce": nonce_to_use,
-            "maxPriorityFeePerGas": priority_fee,
-            "maxFeePerGas": max_fee,
-            "gas": gas,
-            "chainId": self._chain_id,
-        })
+            tx = await call.build_transaction({
+                "from": self.from_address,
+                "nonce": nonce,
+                "maxPriorityFeePerGas": priority_fee,
+                "maxFeePerGas": max_fee,
+                "gas": gas,
+                "chainId": self._chain_id,
+            })
 
-        signed = self.w3.eth.account.sign_transaction(tx, private_key=settings.PRIVATE_KEY)
-        return await self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            signed = self.w3.eth.account.sign_transaction(tx, private_key=settings.PRIVATE_KEY)
+            return await self.w3.eth.send_raw_transaction(signed.raw_transaction)
